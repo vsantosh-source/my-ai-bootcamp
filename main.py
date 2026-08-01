@@ -115,6 +115,13 @@ def call_model_unsafe(question: str, model: str) -> tuple[Answer, int, int, int]
     return answer, total, prompt_tokens, completion_tokens
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    """Landing route so GET / doesn't 404 — also serves as Render's health check."""
+
+    return {"status": "ok", "message": "POST a question to /ask"}
+
+
 @app.post("/ask")
 def ask(body: AskRequest) -> AskResponse:
     """Answer one question with structured output, guardrails, and cost visibility."""
