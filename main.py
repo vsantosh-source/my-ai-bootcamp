@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+import vector_store
+
 THIS_DIR = Path(__file__).resolve().parent
 load_dotenv(THIS_DIR / ".env")
 load_dotenv(THIS_DIR.parent / ".env")
@@ -22,11 +24,17 @@ _client: OpenAI | None = None
 
 ModelName = Literal["gpt-4o-mini", "gpt-4o", "o3-mini"]
 DEFAULT_MODEL: ModelName = "gpt-4o-mini"
+DEFAULT_TOP_K = 5
 MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
     "gpt-4o": (0.0025, 0.01),
     "gpt-4o-mini": (0.00015, 0.0006),
     "o3-mini": (0.0011, 0.0044),
 }
+
+GROUNDING_INSTRUCTIONS = """Answer the question using ONLY the context below. Follow these rules strictly:
+1. Do not use any knowledge outside the provided context.
+2. Cite the document_id for every claim you make, in the form [document_id].
+3. If the context does not contain enough information to answer the question, say so explicitly instead of guessing, and set sources_needed to true."""
 
 
 class Answer(BaseModel):
@@ -41,6 +49,7 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1)
     model: ModelName | None = None
     force_bad: bool = False
+    top_k: int = DEFAULT_TOP_K
 
 
 class AttemptResult(BaseModel):
@@ -59,11 +68,113 @@ class AskResponse(BaseModel):
     latency_ms: int
     cost_usd: float
     attempts: list[AttemptResult]
+    retrieved_chunk_ids: list[str]
+
+
+class IngestRequest(BaseModel):
+    document_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    source: str | None = None
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
+
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    status: str
+
+
+class PineconeHealthResponse(BaseModel):
+    status: str
+    index: str | None = None
+    total_vector_count: int | None = None
+    detail: str | None = None
+
+
+class RetrievedChunk(BaseModel):
+    id: str
+    score: float
+    text: str | None = None
+    document_id: str | None = None
+    source: str | None = None
+
+
+class RetrieveResponse(BaseModel):
+    query: str
+    matches: list[RetrievedChunk]
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/debug/pinecone")
+def debug_pinecone() -> PineconeHealthResponse:
+    """Confirms Pinecone is reachable: valid API key, index exists and responds."""
+    return PineconeHealthResponse(**vector_store.pinecone_health())
+
+
+# curl -s "http://127.0.0.1:8000/debug/retrieve?q=What+is+RAG&top_k=5"
+#
+# Embeds q with text-embedding-3-small and returns the top_k most similar
+# chunks from Pinecone with their similarity scores and metadata. Does NOT
+# call the LLM - use this to verify retrieval quality before wiring it into
+# /ask.
+@app.get("/debug/retrieve")
+def debug_retrieve(q: str, top_k: int = 5) -> RetrieveResponse:
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="q must not be empty")
+
+    try:
+        matches = vector_store.query_similar(q, top_k=top_k)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Pinecone query failed: {exc}")
+
+    return RetrieveResponse(query=q, matches=[RetrievedChunk(**m) for m in matches])
+
+
+# curl -s -X POST http://127.0.0.1:8000/ingest \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#         "document_id": "handbook-v1",
+#         "text": "Long document text goes here...",
+#         "source": "handbook.pdf"
+#       }'
+#
+# Override the default chunk_size/chunk_overlap (env CHUNK_SIZE / CHUNK_OVERLAP,
+# default 800/100) per request:
+# curl -s -X POST http://127.0.0.1:8000/ingest \
+#   -H "Content-Type: application/json" \
+#   -d '{"document_id": "handbook-v1", "text": "...", "chunk_size": 500, "chunk_overlap": 50}'
+@app.post("/ingest")
+def ingest(body: IngestRequest) -> IngestResponse:
+    """Chunks text with RecursiveCharacterTextSplitter, embeds each chunk with
+    text-embedding-3-small, and upserts into Pinecone with document_id/chunk_index/source
+    metadata."""
+    if not body.document_id.strip():
+        raise HTTPException(status_code=400, detail="document_id must not be empty")
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    chunks = vector_store.chunk_text(
+        body.text, chunk_size=body.chunk_size, chunk_overlap=body.chunk_overlap
+    )
+    if not chunks:
+        raise HTTPException(status_code=400, detail="text produced no chunks after splitting")
+
+    try:
+        vector_store.ensure_index()
+        chunks_indexed = vector_store.upsert_document_chunks(
+            document_id=body.document_id, chunks=chunks, source=body.source
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Pinecone ingest failed: {exc}")
+
+    return IngestResponse(
+        document_id=body.document_id, chunks_indexed=chunks_indexed, status="indexed"
+    )
 
 
 def get_client() -> OpenAI:
@@ -89,10 +200,21 @@ def usage_counts(completion) -> tuple[int, int, int]:
     return usage.total_tokens, usage.prompt_tokens, usage.completion_tokens
 
 
-def call_structured_model(question: str, model: ModelName) -> tuple[Answer, int, int, int]:
+def build_grounding_prompt(question: str, chunks: list[dict]) -> str:
+    if chunks:
+        context = "\n\n".join(
+            f"[document_id: {chunk['document_id']}]\n{chunk['text']}" for chunk in chunks
+        )
+    else:
+        context = "(no relevant context was found)"
+
+    return f"{GROUNDING_INSTRUCTIONS}\n\nContext:\n{context}\n\nQuestion: {question}"
+
+
+def call_structured_model(prompt: str, model: ModelName) -> tuple[Answer, int, int, int]:
     completion = get_client().chat.completions.parse(
         model=model,
-        messages=[{"role": "user", "content": question}],
+        messages=[{"role": "user", "content": prompt}],
         response_format=Answer,
     )
 
@@ -136,6 +258,14 @@ def ask(body: AskRequest) -> AskResponse:
     total_completion_tokens = 0
     start = time.perf_counter()
 
+    try:
+        retrieved = vector_store.query_similar(body.question, top_k=body.top_k)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Retrieval failed: {exc}")
+
+    grounded_prompt = build_grounding_prompt(body.question, retrieved)
+    retrieved_chunk_ids = [chunk["id"] for chunk in retrieved]
+
     for attempt in range(2):
         try:
             if body.force_bad and attempt == 0:
@@ -173,7 +303,7 @@ def ask(body: AskRequest) -> AskResponse:
                 )
             else:
                 answer, tokens_used, prompt_tokens, completion_tokens = call_structured_model(
-                    body.question, model
+                    grounded_prompt, model
                 )
                 total_tokens_used += tokens_used
                 total_prompt_tokens += prompt_tokens
@@ -198,6 +328,7 @@ def ask(body: AskRequest) -> AskResponse:
                 latency_ms=latency_ms,
                 cost_usd=round(cost_usd, 6),
                 attempts=attempts,
+                retrieved_chunk_ids=retrieved_chunk_ids,
             )
         except (ValidationError, ValueError) as exc:
             last_error = str(exc)
